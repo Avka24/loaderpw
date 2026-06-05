@@ -1,0 +1,1536 @@
+-- =====================================================
+-- AUTO FARM + PNB (SB/HB) + PLANT + SAVE WORLD + BUY PACK
+-- =====================================================
+
+local bot = getBot(SLOT_ID)
+
+if not bot then
+    log("❌ Bot not found")
+    return
+end
+
+-- ====================== CONFIG ======================
+local CONFIG = {
+    FARM_WORLD       = "KAKAFERI",
+    SAVE_WORLD       = "BEAVKA1:AKA",
+    TARGET_ID        = 1,
+    HIT_BLOCK        = 10,
+    SEED_THRESHOLD   = 500,
+    BLOCK_THRESHOLD  = 20,
+    KEEP_SEED_AMOUNT = 250,
+    -- ===== FARM CONFIG =====
+    ROW_TOTAL = 3,
+    PLANT_MOVE = 500,
+    DELAY_PLANT        = 250,
+    DELAY_HARVEST        = 350,
+    -- ===== PNB CONFIG (SB/HB packet) =====
+    PNB_COUNT_BLOCK = 20,   -- siklus SB+HB per spot
+    PNB_HIT_COUNT   = 4,    -- jumlah HB per siklus
+    PNB_LOOP_DELAY  = 1000, -- delay setelah semua spot selesai 1 putaran (ms)
+
+    -- ===== PNB RANDOM WORLD CONFIG =====
+    PNB_MAX_CYCLES  = 5,    -- berapa siklus (pnb+collect) sebelum kembali ke farm
+    PNB_REJOIN_DELAY = 4500, -- delay setelah warp ke world random (ms)
+
+    -- ===== COLLECT MOVE CONFIG =====
+    COLLECT_MOVE_DELAY = 100, -- delay per langkah (ms)
+
+    -- ===== BUY PACK CONFIG =====
+    BUY_PACK_ENABLED = false,  -- true = aktif, false = skip buy pack
+    GEM_THRESHOLD    = 5000,
+    GEM_STOP         = 100,
+    BUY_PACK_ID      = "SmallLock",
+    PACK_PRICE       = 100,
+    BUY_PACK_DROP    = { id = 410, x = 75, y = 28 },
+
+    ITEM_DROP = {
+        { id = 3364, x = 9, y = 36 },
+        { id = 3365, x = 9, y = 36 },
+        { id = 3366, x = 9, y = 36 },
+        { id = 2237, x = 9, y = 36 },
+        { id = 2339, x = 9, y = 36 },
+        { id = 2338, x = 9, y = 36 },
+    },
+
+  PNB_SPOTS = {
+       -- { dx = -2, dy =  1 },
+        { dx =  -1, dy =  1 },
+        { dx = -1, dy =  -1 },
+        { dx =  -1, dy =  0 },
+       -- { dx = 2, dy =  1 },
+    },
+
+    -- ===== AUTO BAN CONFIG =====
+    AUTO_BAN_ENABLED = true,   -- true = aktif, false = nonaktif
+    WHITELIST = {
+        ["PXZYZZ73"]    = true,
+       -- ["LYLEFAHEY"] = true,
+    },
+}
+
+local LOCK_IDS = {
+    [2212] = true,  -- Newbie Lock
+    [413]  = true,  -- World Lock
+}
+local WATER_ID = 16
+
+local BLOCK_BLACKLIST = {
+    [110] = true,   -- Main Door / bedrock, jangan dihancurkan
+}
+
+
+-- ============================================================
+--                     STATE VARIABLES
+-- ============================================================
+
+local isBusy        = false
+local isInSaveWorld = false
+local needCollect   = true
+local pnbJustRejoined   = false 
+local pnbOriginX    = 0
+local pnbOriginY    = 0
+local knownPlayers  = {}
+
+-- ===== PNB RANDOM WORLD STATE =====
+local pnbRandomWorld    = nil   -- nama world random yang sedang dipakai
+local pnbCycleCount     = 0     -- jumlah siklus (pnb+collect) yang sudah selesai
+local isInPnbMode       = false -- sedang dalam mode PNB random world
+local pnbNeedCollect    = false -- apakah perlu collect setelah rejoin ke pnb world
+
+-- ============================================================
+
+bot:set_auto_reconnect(true)
+
+-- ============================================================
+--                     RANDOM WORLD GENERATOR
+-- ============================================================
+
+local function generate_random_world()
+    -- Diawali huruf, total 7 atau 8 karakter, campuran huruf dan angka
+    local letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    local alphanums = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    -- Tentukan panjang: 7 atau 8
+    local length = 7 + math.random(0, 1)
+
+    local name = ""
+    -- Karakter pertama: huruf
+    local firstIdx = math.random(1, #letters)
+    name = name .. string.sub(letters, firstIdx, firstIdx)
+
+    -- Karakter sisanya: huruf atau angka, pastikan ada minimal 1 angka
+    local hasNumber = false
+    for i = 2, length do
+        local idx = math.random(1, #alphanums)
+        local char = string.sub(alphanums, idx, idx)
+        name = name .. char
+        if char >= "0" and char <= "9" then
+            hasNumber = true
+        end
+    end
+
+    -- Jika belum ada angka, ganti salah satu posisi (2 sampai length) dengan angka
+    if not hasNumber then
+        local replacePos = math.random(2, length)
+        local digits = "0123456789"
+        local digitIdx = math.random(1, #digits)
+        local digit = string.sub(digits, digitIdx, digitIdx)
+        name = string.sub(name, 1, replacePos - 1) .. digit .. string.sub(name, replacePos + 1)
+    end
+
+    return name
+end
+
+-- ============================================================
+--                        HELPER FUNCTIONS
+-- ============================================================
+
+local function log_status(msg)
+    log("[AutoFarm] " .. msg)
+end
+
+local function get_current_row()
+    return bot:pos().tile_y
+end
+
+local function count_seeds()
+    local inv   = bot:get_inventory()
+    local total = 0
+    for _, item in ipairs(inv) do
+        if item.id == CONFIG.TARGET_ID and item.inventory_type == 2 then
+            total = total + item.amount
+        end
+    end
+    return total
+end
+
+local function get_inventory_count()
+    local inv        = bot:get_inventory()
+    local seedCount  = 0
+    local blockCount = 0
+    for _, item in ipairs(inv) do
+        if item.id == CONFIG.TARGET_ID then
+            if item.inventory_type == 2 then
+                seedCount = seedCount + item.amount
+            elseif item.inventory_type == 0 then
+                blockCount = blockCount + item.amount
+            end
+        end
+    end
+    return seedCount, blockCount
+end
+
+local function get_item_inventory_type(itemId)
+    local inv = bot:get_inventory()
+    for _, item in ipairs(inv) do
+        if item.id == itemId then
+            return item.inventory_type, item.amount
+        end
+    end
+    return nil, 0
+end
+
+local function count_ready_seeds_in_row(row)
+    local count = 0
+    local w     = bot:get_world()
+    for _, seed in ipairs(w.seeds) do
+        if seed.ready and seed.block_type == CONFIG.TARGET_ID and seed.y == row then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+
+local function count_all_ready_seeds()
+    local base  = get_current_row()
+    local total = 0
+    for i = 0, CONFIG.ROW_TOTAL - 1 do
+        total = total + count_ready_seeds_in_row(base + i)
+    end
+    return total
+end
+
+local function check_and_place_lock()
+    log_status("🔒 Cek apakah world sudah di-lock...")
+
+    local w = bot:get_world()
+
+    -- Cek apakah sudah ada lock (ID 2212 atau 413) di world tiles
+    for _, tile in ipairs(w.tiles or {}) do
+        if LOCK_IDS[tile.fg] or LOCK_IDS[tile.bg] then
+            log_status("✅ World sudah di-lock (ID=" .. (tile.fg ~= 0 and tile.fg or tile.bg) .. "), skip pasang lock.")
+            return
+        end
+    end
+
+    log_status("⚠️ World BELUM di-lock! Coba pasang lock...")
+
+    -- Cari lock di inventori (prioritas World Lock dulu, lalu Newbie Lock)
+    local lockIdToPlace = nil
+    local inv = bot:get_inventory()
+    for _, item in ipairs(inv) do
+        if item.id == 413 then
+            lockIdToPlace = 413
+            break
+        end
+    end
+    if not lockIdToPlace then
+        for _, item in ipairs(inv) do
+            if item.id == 2212 then
+                lockIdToPlace = 2212
+                break
+            end
+        end
+    end
+
+    -- Posisi bot saat masuk (entrance)
+    local pos = bot:pos()
+    local botX = pos.tile_x
+    local botY = pos.tile_y
+
+local targetX = botX
+local targetY = botY - 1
+
+local entranceTile = bot:get_tile(targetX, targetY)
+
+-- Jika di bawah entrance sudah ada lock, skip seluruh proses
+if entranceTile and LOCK_IDS[entranceTile.fg] then
+    log_status("✅ Entrance sudah berisi lock ID=" .. entranceTile.fg .. ", skip break & place lock.")
+    return
+end
+
+log_status(string.format(
+    "🔨 Break block di bawah entrance (%d, %d)...", targetX, targetY
+))
+
+for i = 1, CONFIG.HIT_BLOCK do
+    bot:hit_block(0, -1)
+    sleep_ms(CONFIG.DELAY_HARVEST)
+
+    local check = bot:get_tile(targetX, targetY)
+
+    if check and check.fg == 0 then
+        log_status("✅ Tile bawah entrance berhasil di-clear!")
+        break
+    end
+end
+
+    if not lockIdToPlace then
+        log_status("⚠️ Tidak ada lock di inventori! Mencoba beli WorldLock...")
+        bot:buy_pack("WorldLock")
+        sleep_ms(500)
+        bot:buy_pack("WorldLock")
+        sleep_ms(500)
+        bot:buy_pack("WorldLock")
+        
+        sleep_ms(15000)
+
+        -- Cek ulang inventori setelah beli
+        local inv2 = bot:get_inventory()
+        for _, item in ipairs(inv2) do
+            if item.id == 413 then
+                lockIdToPlace = 413
+                break
+            end
+        end
+        if not lockIdToPlace then
+            for _, item in ipairs(inv2) do
+                if item.id == 2212 then
+                    lockIdToPlace = 2212
+                    break
+                end
+            end
+        end
+
+        if not lockIdToPlace then
+            log_status("❌ Beli WorldLock gagal atau tidak diterima di inventori, skip pasang lock.")
+            return
+        end
+        log_status("✅ WorldLock berhasil dibeli! Lanjut pasang lock...")
+    end
+
+    -- Place lock di tile bawah entrance
+    sleep_ms(300)
+    local tile = bot:get_tile(targetX, targetY)
+    if tile and tile.fg == 0 then
+        bot:place_block(0, -1, lockIdToPlace)
+        sleep_ms(500)
+        log_status("✅ Lock ID=" .. lockIdToPlace .. " berhasil dipasang di (" .. targetX .. "," .. targetY .. ")!")
+    else
+        log_status("⚠️ Tile (" .. targetX .. "," .. targetY .. ") masih blocked, lock tidak dipasang.")
+    end
+end
+-- ============================================================
+--              BREAK BLOCKING BLOCKS (HELPER BARU)
+-- ============================================================
+
+local function break_blocking_blocks(tx, ty)
+    local tile = bot:get_tile(tx, ty)
+    if not tile then return end
+
+    if tile.fg ~= 0 then
+
+       -- ✅ SKIP hanya jika fg=37 DAN seed di tile ini adalah TARGET_ID
+        if tile.fg == 37 then
+            local w_check = bot:get_world()
+            local isTargetTree = false
+            for _, seed in ipairs(w_check.seeds) do
+                if seed.x == tx and seed.y == ty and seed.block_type == CONFIG.TARGET_ID then
+                    isTargetTree = true
+                    break
+                end
+            end
+            if isTargetTree then
+                log_status("🌳 Tree TARGET_ID di (" .. tx .. "," .. ty .. "), skip break.")
+                return
+            else
+                log_status("🪓 fg=37 tapi bukan TARGET_ID di (" .. tx .. "," .. ty .. "), lanjut break...")
+            end
+        end
+
+        -- Skip jika ID ada di static blacklist
+        if BLOCK_BLACKLIST[tile.fg] then
+            log_status("🚫 Block fg ID=" .. tile.fg .. " di (" .. tx .. "," .. ty .. ") di-BLACKLIST, skip break.")
+            return
+        end
+
+        -- Handler khusus water (ID 16) pakai owBK
+        if tile.fg == WATER_ID then
+            log_status("💧 Water block di (" .. tx .. "," .. ty .. "), kirim owBK packet...")
+            for i = 1, CONFIG.HIT_BLOCK do
+                bot:send("owBK", { tx, ty })
+                sleep_ms(CONFIG.DELAY_HARVEST)
+                local check = bot:get_tile(tx, ty)
+                if check and check.fg == 0 then
+                    log_status("✅ Water di (" .. tx .. "," .. ty .. ") berhasil dihapus!")
+                    break
+                end
+            end
+            local final = bot:get_tile(tx, ty)
+            if final and final.fg == WATER_ID then
+                log_status("⚠️ Water masih ada setelah " .. CONFIG.HIT_BLOCK .. " hit di (" .. tx .. "," .. ty .. ")")
+            end
+            return
+        end
+
+        -- Block biasa, hit normal
+        log_status("⚠️ Block fg menghalangi di (" .. tx .. "," .. ty .. "), break...")
+
+        -- Pastikan bot dekat dulu sebelum hit (max 2 tile)
+        local dist = math.abs(tx - bot:pos().tile_x) + math.abs(ty - bot:pos().tile_y)
+        if dist > 2 then
+            log_status("🚶 Terlalu jauh (" .. dist .. " tile), jalan dulu ke (" .. tx .. "," .. ty .. ")...")
+            pcall(function() bot:find_path(tx, ty) end)
+            sleep_ms(1400)
+        end
+
+        local dx = tx - bot:pos().tile_x
+        local dy = ty - bot:pos().tile_y
+        for i = 1, CONFIG.HIT_BLOCK do
+            bot:hit_block(dx, dy)
+            sleep_ms(CONFIG.DELAY_HARVEST)
+            local check = bot:get_tile(tx, ty)
+            if check and check.fg == 0 then
+                log_status("✅ Block fg di (" .. tx .. "," .. ty .. ") berhasil dihancurkan!")
+                break
+            end
+        end
+        local final = bot:get_tile(tx, ty)
+        if final and final.fg ~= 0 then
+            log_status("⚠️ Block fg masih ada setelah " .. CONFIG.HIT_BLOCK .. " hit di (" .. tx .. "," .. ty .. ")")
+        end
+    end
+end
+
+-- Versi offset (dari posisi bot sekarang)
+local function break_blocking_blocks_offset(dx, dy)
+    local pos = bot:pos()
+    break_blocking_blocks(pos.tile_x + dx, pos.tile_y + dy)
+end
+
+-- ============================================================
+--                      RECONNECT HELPER
+-- ============================================================
+
+local function ensure_in_world(targetWorld, label)
+    local maxTry = 5
+    for attempt = 1, maxTry do
+        if bot:state() == "InWorld" then return true end
+        log_status("⚠️ [" .. label .. "] Tidak di world (attempt " .. attempt .. "/" .. maxTry .. "), reconnect...")
+        if bot:state() == "Failed" or bot:state() == "Disconnected" then
+            bot:connect()
+            sleep_ms(3000)
+        end
+        bot:warp(targetWorld)
+        sleep_ms(4500)
+    end
+    log_status("❌ [" .. label .. "] Gagal masuk world setelah " .. maxTry .. " attempt.")
+    return false
+end
+
+-- ============================================================
+--                      TILE HELPER
+-- ============================================================
+
+local function clear_tile_if_blocked(tx, ty)
+    local tile = bot:get_tile(tx, ty)
+    if tile and tile.fg ~= 0 then
+        log_status("⚠️ Tile (" .. tx .. "," .. ty .. ") blocked, menghancurkan dulu...")
+        local dx = tx - bot:pos().tile_x
+        local dy = ty - bot:pos().tile_y
+        for i = 1, CONFIG.HIT_BLOCK do
+            bot:hit_block(dx, dy)
+            sleep_ms(CONFIG.DELAY_HARVEST)
+            local check = bot:get_tile(tx, ty)
+            if check and check.fg == 0 then
+                log_status("✅ Tile (" .. tx .. "," .. ty .. ") berhasil dihancurkan!")
+                break
+            end
+        end
+        local final = bot:get_tile(tx, ty)
+        if final and final.fg ~= 0 then
+            log_status("⚠️ Tile masih blocked setelah " .. CONFIG.HIT_BLOCK .. " hit, skip.")
+        end
+    end
+end
+
+local function safe_find_path(tx, ty)
+    local ok = pcall(function() bot:find_path(tx, ty) end)
+    if not ok then
+        log_status("⚠️ find_path blocked ke (" .. tx .. "," .. ty .. "), mencoba hancurkan block...")
+        clear_tile_if_blocked(tx, ty)
+        sleep_ms(300)
+        local ok2 = pcall(function() bot:find_path(tx, ty) end)
+        if not ok2 then
+            log_status("❌ find_path masih gagal ke (" .. tx .. "," .. ty .. "), skip.")
+        end
+    end
+    sleep_ms(1400)
+end
+
+-- ============================================================
+--                     WAIT UNTIL READY
+-- ============================================================
+
+local function wait_until_rows_ready()
+    local CHECK_INTERVAL = 5000
+    local BUFFER_MS      = 500
+    local base           = get_current_row()
+
+    while true do
+        local w            = bot:get_world()
+        local totalSeeds   = 0
+        local readyCount   = 0
+        local maxRemaining = 0
+
+        for _, seed in ipairs(w.seeds) do
+            if seed.block_type == CONFIG.TARGET_ID then
+                for i = 0, CONFIG.ROW_TOTAL - 1 do
+                    if seed.y == base + i then
+                        totalSeeds = totalSeeds + 1
+                        if seed.ready then
+                            readyCount = readyCount + 1
+                        else
+                            if seed.remaining_ms and seed.remaining_ms > maxRemaining then
+                                maxRemaining = seed.remaining_ms
+                            end
+                        end
+                        break
+                    end
+                end
+            end
+        end
+
+        if totalSeeds == 0 then
+            log_status("⚠️ Tidak ada seed di " .. CONFIG.ROW_TOTAL .. " row, lanjut...")
+            return
+        end
+
+        if readyCount >= totalSeeds then
+            log_status(string.format("✅ Semua seed sudah ready! (%d/%d)", readyCount, totalSeeds))
+            return
+        end
+
+        log_status(string.format(
+            "⏳ Menunggu... Ready: %d/%d | Terlama: %.1f detik (~%d menit)",
+            readyCount, totalSeeds,
+            maxRemaining / 1000,
+            math.ceil(maxRemaining / 60000)
+        ))
+
+        local elapsed = 0
+        local target  = maxRemaining + BUFFER_MS
+        while elapsed < target do
+            sleep_ms(CHECK_INTERVAL)
+            elapsed = elapsed + CHECK_INTERVAL
+
+            local w2          = bot:get_world()
+            local stillWaiting = false
+            local maxLeft      = 0
+            for _, seed in ipairs(w2.seeds) do
+                if seed.block_type == CONFIG.TARGET_ID then
+                    for i = 0, CONFIG.ROW_TOTAL - 1 do
+                        if seed.y == base + i and not seed.ready then
+                            stillWaiting = true
+                            if seed.remaining_ms and seed.remaining_ms > maxLeft then
+                                maxLeft = seed.remaining_ms
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+
+            if not stillWaiting then
+                log_status("✅ Semua seed sudah ready (early detect)!")
+                return
+            end
+            log_status(string.format("⏳ Masih menunggu... sisa ~%.1f detik", maxLeft / 1000))
+        end
+    end
+end
+
+-- ============================================================
+--                      REFRESH WORLD
+-- ============================================================
+
+local function refresh_world_data()
+    log_status("🔄 Refresh world: " .. CONFIG.FARM_WORLD)
+    bot:warp(CONFIG.FARM_WORLD)
+    sleep_ms(4500)
+    if bot:state() == "InWorld" then
+        log_status("✅ World berhasil di-refresh!")
+    end
+end
+
+-- ============================================================
+--                      AUTO RECONNECT EVENT
+-- ============================================================
+
+bot:on(events.STATE_CHANGED, function(data)
+    local state = data.state
+    if state == "MenuIdle" or state == "Failed" then
+        local targetWorld
+
+        -- Jika sedang PNB mode, inline handler di do_pnb_in_random_world yang handle reconnect
+        if isInPnbMode and pnbRandomWorld then
+            targetWorld = pnbRandomWorld
+            log_status("⚠️ Disconnect saat PNB Mode → inline handler akan rejoin ke: " .. targetWorld)
+        elseif isInSaveWorld then
+            targetWorld = CONFIG.SAVE_WORLD
+            log_status("⚠️ Disconnect: " .. state .. " → Rejoining save world: " .. targetWorld)
+        else
+            targetWorld = CONFIG.FARM_WORLD
+            log_status("⚠️ Disconnect: " .. state .. " → Rejoining farm world: " .. targetWorld)
+        end
+
+        needCollect = true
+        isBusy      = false
+        sleep_ms(1500)
+
+        if state == "MenuIdle" then
+            bot:warp(targetWorld)
+        elseif state == "Failed" then
+            bot:connect()
+            sleep_ms(2500)
+            if bot:state() == "MenuIdle" then
+                bot:warp(targetWorld)
+            end
+        end
+    end
+end)
+
+-- ============================================================
+--                      COLLECT MOVE
+-- ============================================================
+
+local function do_collect_move()
+    isBusy = true
+
+    local originX = bot:pos().tile_x
+    local originY = bot:pos().tile_y
+    pnbOriginX    = originX
+    pnbOriginY    = originY
+
+    log_status("📦 Collect move dari (" .. originX .. "," .. originY .. ")...")
+
+    local targetTiles = {}
+    for _, spot in ipairs(CONFIG.PNB_SPOTS) do
+        table.insert(targetTiles, {
+            x = originX + spot.dx,
+            y = originY + spot.dy,
+        })
+    end
+
+    for _, t in ipairs(targetTiles) do
+        log_status("  → find_path ke (" .. t.x .. ", " .. t.y .. ")")
+        safe_find_path(t.x, t.y)
+        sleep_ms(CONFIG.COLLECT_MOVE_DELAY)
+    end
+
+    log_status("🔙 Kembali ke origin (" .. originX .. "," .. originY .. ")")
+    safe_find_path(originX, originY)
+    sleep_ms(400)
+
+    log_status("✅ Collect selesai.")
+    needCollect    = false
+    pnbNeedCollect = false
+    isBusy         = false
+end
+
+-- ============================================================
+--                       BUY PACK
+-- ============================================================
+
+local function do_buy_pack()
+    isBusy = true
+    local gems = bot.gems
+    log_status("💎 Gems: " .. gems .. " (threshold: " .. CONFIG.GEM_THRESHOLD .. ")")
+
+    if gems < CONFIG.GEM_THRESHOLD then
+        isBusy = false
+        return
+    end
+
+    local totalCanBuy = math.floor((gems - CONFIG.GEM_STOP) / CONFIG.PACK_PRICE)
+    if totalCanBuy <= 0 then
+        log_status("⚠️ Tidak cukup gems untuk beli pack.")
+        isBusy = false
+        return
+    end
+
+    log_status("🛒 Mulai beli " .. totalCanBuy .. "x pack: " .. CONFIG.BUY_PACK_ID)
+
+    -- PHASE 1: BELI PACK
+    local buyCount = 0
+    local i        = 1
+    while i <= totalCanBuy do
+        if bot:state() ~= "InWorld" then
+            log_status("⚠️ Disconnect saat beli pack! Reconnect...")
+            local ok = ensure_in_world(CONFIG.FARM_WORLD, "BuyPack-Reconnect")
+            if not ok then
+                log_status("❌ Gagal reconnect. Abort beli pack.")
+                isBusy = false
+                return
+            end
+            local newGems   = bot.gems
+            local remaining = math.floor((newGems - CONFIG.GEM_STOP) / CONFIG.PACK_PRICE)
+            if remaining <= 0 then break end
+            totalCanBuy = buyCount + remaining
+        end
+        bot:buy_pack(CONFIG.BUY_PACK_ID)
+        sleep_ms(2000)
+        buyCount = buyCount + 1
+        log_status("✅ Pack ke-" .. buyCount .. "/" .. totalCanBuy .. " | Gems sisa: " .. bot.gems)
+        i = i + 1
+    end
+
+    log_status("🏁 Selesai beli pack. Total: " .. buyCount .. "x | Gems: " .. bot.gems)
+
+    -- PHASE 2: WARP KE SAVE WORLD
+    isInSaveWorld = true
+    log_status("📦 Warp ke save world...")
+    bot:warp(CONFIG.SAVE_WORLD)
+    sleep_ms(4500)
+
+    if bot:state() ~= "InWorld" then
+        local ok = ensure_in_world(CONFIG.SAVE_WORLD, "BuyPack-SaveWorld")
+        if not ok then
+            isInSaveWorld = false
+            bot:warp(CONFIG.FARM_WORLD)
+            sleep_ms(4500)
+            isBusy = false
+            return
+        end
+    end
+
+    -- PHASE 3: DROP ITEM
+    local dropCfg  = CONFIG.BUY_PACK_DROP
+    local maxRetry = 3
+    local dropDone = false
+
+    for attempt = 1, maxRetry do
+        if bot:state() ~= "InWorld" then
+            local ok = ensure_in_world(CONFIG.SAVE_WORLD, "BuyPack-Drop")
+            if not ok then break end
+        end
+        if bot:state() == "InWorld" then
+            local invType, amount = get_item_inventory_type(dropCfg.id)
+            if invType ~= nil and amount > 0 then
+                log_status("📍 Drop item ID=" .. dropCfg.id .. " → (" .. dropCfg.x .. "," .. dropCfg.y .. ")")
+                safe_find_path(dropCfg.x, dropCfg.y)
+                sleep_ms(500)
+                bot:drop(dropCfg.id, amount, invType)
+                sleep_ms(800)
+                local _, amountAfter = get_item_inventory_type(dropCfg.id)
+                if amountAfter < amount then
+                    log_status("✅ Drop berhasil! x" .. (amount - amountAfter))
+                    dropDone = true
+                    break
+                else
+                    log_status("⚠️ Drop gagal, retry " .. (attempt + 1) .. "...")
+                    sleep_ms(1500)
+                end
+            else
+                log_status("⚠️ Item ID=" .. dropCfg.id .. " tidak ada di inventori, skip.")
+                dropDone = true
+                break
+            end
+        end
+    end
+
+    if not dropDone then
+        log_status("❌ Drop gagal setelah " .. maxRetry .. " attempt.")
+    end
+
+    -- PHASE 4: KEMBALI KE FARM
+    sleep_ms(1000)
+    isInSaveWorld = false
+    log_status("🔙 Kembali ke farm world...")
+    bot:warp(CONFIG.FARM_WORLD)
+    sleep_ms(4500)
+
+    if bot:state() ~= "InWorld" then
+        ensure_in_world(CONFIG.FARM_WORLD, "BuyPack-ReturnFarm")
+    end
+
+    log_status("💎 Gems setelah buy pack: " .. bot.gems)
+    needCollect = true
+    isBusy      = false
+end
+
+-- ============================================================
+--                    SAVE WORLD + DROP
+-- ============================================================
+
+local function go_to_save_and_drop()
+    isInSaveWorld = true
+    log_status("💾 Masuk save world: " .. CONFIG.SAVE_WORLD)
+    bot:warp(CONFIG.SAVE_WORLD)
+    sleep_ms(4000)
+
+    if bot:state() ~= "InWorld" then
+        local ok = ensure_in_world(CONFIG.SAVE_WORLD, "SaveAndDrop")
+        if not ok then
+            isInSaveWorld = false
+            bot:warp(CONFIG.FARM_WORLD)
+            sleep_ms(4500)
+            needCollect = true
+            return
+        end
+    end
+
+    -- DROP SEED (sisakan KEEP_SEED_AMOUNT)
+    local inv = bot:get_inventory()
+    for _, item in ipairs(inv) do
+        if item.id == CONFIG.TARGET_ID and item.inventory_type == 2 then
+            local keepAmount = CONFIG.KEEP_SEED_AMOUNT
+            if item.amount > keepAmount then
+                local dropAmount = item.amount - keepAmount
+                bot:drop(item.id, dropAmount, 2)
+                sleep_ms(600)
+                log_status("✅ Drop " .. dropAmount .. " seed | Keep: " .. keepAmount)
+            else
+                log_status("⚠️ Seed hanya " .. item.amount .. " (< keep " .. keepAmount .. "), skip drop seed.")
+            end
+        end
+    end
+
+    sleep_ms(800)
+
+    -- DROP ITEM_DROP SEMUA (tidak ada keep)
+    for _, dropCfg in ipairs(CONFIG.ITEM_DROP) do
+        local itemId  = dropCfg.id
+        local targetX = dropCfg.x
+        local targetY = dropCfg.y
+        local invType, amount = get_item_inventory_type(itemId)
+        if invType ~= nil and amount > 0 then
+            log_status("📍 Drop item ID=" .. itemId .. " x" .. amount .. " → (" .. targetX .. "," .. targetY .. ")")
+            safe_find_path(targetX, targetY)
+            sleep_ms(500)
+            bot:drop(itemId, amount, invType)
+            sleep_ms(600)
+            log_status("✅ Drop ID=" .. itemId .. " x" .. amount)
+        else
+            log_status("⚠️ Item ID=" .. itemId .. " tidak ada di inventori, skip.")
+        end
+    end
+
+    sleep_ms(1500)
+    isInSaveWorld = false
+    log_status("🔙 Kembali ke farm world...")
+    bot:warp(CONFIG.FARM_WORLD)
+    sleep_ms(3500)
+
+    needCollect = true
+end
+
+-- ============================================================
+--             CEK SEED THRESHOLD → STOP & DROP
+-- ============================================================
+
+local function check_seed_threshold()
+    local seedCount = count_seeds()
+    if seedCount >= CONFIG.SEED_THRESHOLD then
+        log_status(string.format(
+            "🚨 SEED THRESHOLD TERCAPAI! Seed: %d >= %d → Stop semua aktivitas, warp ke save world!",
+            seedCount, CONFIG.SEED_THRESHOLD
+        ))
+        isBusy = true
+        go_to_save_and_drop()
+        isBusy = false
+        return true
+    end
+    return false
+end
+
+-- ============================================================
+--                  HARVEST + PLANT (MULTI ROW SNAKE)
+-- ============================================================
+
+local function do_harvest_and_plant()
+    isBusy = true
+
+    -- Simpan posisi awal SEKALI di sini, tidak boleh berubah
+    local start_pos = bot:pos()
+    local base_row  = start_pos.tile_y   -- y30 (posisi awal bot)
+    local start_x   = start_pos.tile_x
+    local w         = bot:get_world()
+    local max_x     = w.width - 1
+
+    -- Validasi row range: hanya base_row sampai base_row + ROW_TOTAL - 1
+    local row_min = base_row
+    local row_max = base_row + CONFIG.ROW_TOTAL - 1  -- y30 + 3 - 1 = y32
+
+    local harvested = 0
+    local planted   = 0
+
+    log_status(string.format(
+        "🚜 Mulai harvest. base_row=%d, row_range=%d~%d, start_x=%d",
+        base_row, row_min, row_max, start_x
+    ))
+
+    local function has_tree_at(x, row)
+        local w_cur = bot:get_world()
+        for _, seed in ipairs(w_cur.seeds) do
+            if seed.x == x and seed.y == row and seed.block_type == CONFIG.TARGET_ID then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function process_tile(x, row)
+        -- Validasi: jangan proses di luar range row yang diizinkan
+        if row < row_min or row > row_max then
+            log_status("⛔ Row Y=" .. row .. " di luar range (" .. row_min .. "~" .. row_max .. "), skip!")
+            return
+        end
+
+        -- 1. Hancurkan block yang menghalangi di tile ini
+        break_blocking_blocks(x, row)
+
+        local w_cur = bot:get_world()
+
+        -- 2. Cek apakah ada seed ready
+        for _, seed in ipairs(w_cur.seeds) do
+            if seed.x == x and seed.y == row and seed.ready and seed.block_type == CONFIG.TARGET_ID then
+                bot:hit_block(0, 0)
+                sleep_ms(CONFIG.DELAY_HARVEST)
+                harvested = harvested + 1
+                log_status("✅ Harvest X=" .. x .. " Y=" .. row)
+
+                break_blocking_blocks(x, row)
+
+                if count_seeds() > 0 then
+                    bot:plant(x, row, CONFIG.TARGET_ID)
+                    sleep_ms(CONFIG.DELAY_PLANT)
+                    planted = planted + 1
+                    log_status("🌱 Replant X=" .. x .. " Y=" .. row)
+                end
+                return
+            end
+        end
+
+        -- 3. Tile kosong (tidak ada pohon sama sekali) → plant
+        if not has_tree_at(x, row) then
+            break_blocking_blocks(x, row)
+            local tile = bot:get_tile(x, row)
+            if tile and tile.fg == 0 and count_seeds() > 0 then
+                bot:plant(x, row, CONFIG.TARGET_ID)
+                sleep_ms(CONFIG.DELAY_PLANT)
+                planted = planted + 1
+                log_status("🌱 Tile kosong, plant X=" .. x .. " Y=" .. row)
+            end
+        end
+    end
+
+    -- ===== LOOP SETIAP ROW — PAKAI row_min s/d row_max =====
+    for i = 0, CONFIG.ROW_TOTAL - 1 do
+        local row     = base_row + i      -- y30, y31, y32 (tidak pernah y33+)
+        local go_left = (i % 2 == 1)
+
+        -- Double-check: pastikan row tidak melebihi row_max
+        if row > row_max then
+            log_status("⛔ Row Y=" .. row .. " melebihi row_max=" .. row_max .. ", stop loop!")
+            break
+        end
+
+        local ready = count_ready_seeds_in_row(row)
+        log_status(string.format(
+            "📍 [Row %d/%d] Y=%d | ready=%d | arah=%s",
+            i+1, CONFIG.ROW_TOTAL, row, ready,
+            go_left and "kanan→kiri" or "kiri→kanan"
+        ))
+
+        -- Pindah ke awal row ini
+        local first_x = go_left and max_x or start_x
+        break_blocking_blocks(first_x, row)
+        safe_find_path(first_x, row)
+
+        -- Tunggu bot sampai di row yang benar
+        local attempts = 0
+        while bot:pos().tile_y ~= row and attempts < 5 do
+            log_status("⚠️ Bot belum di Y=" .. row .. " (sekarang di Y=" .. bot:pos().tile_y .. "), retry...")
+            sleep_ms(800)
+            break_blocking_blocks(first_x, row)
+            safe_find_path(first_x, row)
+            attempts = attempts + 1
+        end
+
+        -- Jika bot tidak berhasil pindah ke row yang benar, skip row ini
+        if bot:pos().tile_y ~= row then
+            log_status("❌ Gagal pindah ke Y=" .. row .. " (bot di Y=" .. bot:pos().tile_y .. "), skip row ini.")
+            goto continue
+        end
+
+        -- ===== JALAN TILE PER TILE DI ROW INI =====
+        if not go_left then
+            for x = start_x, max_x do
+                if x + 1 <= max_x then
+                    break_blocking_blocks(x + 1, row)
+                end
+                while bot:pos().tile_x < x do
+                    bot:walk(1, 0)
+                    sleep_ms(CONFIG.PLANT_MOVE)
+                end
+                sleep_ms(300)
+                process_tile(x, row)
+            end
+        else
+            for x = max_x, start_x, -1 do
+                if x - 1 >= start_x then
+                    break_blocking_blocks(x - 1, row)
+                end
+                while bot:pos().tile_x > x do
+                    bot:walk(-1, 0)
+                    sleep_ms(CONFIG.PLANT_MOVE)
+                end
+                sleep_ms(300)
+                process_tile(x, row)
+            end
+        end
+
+        ::continue::
+    end
+
+    log_status(string.format(
+        "✅ Selesai! Row: %d~%d | Harvest: %d | Plant: %d",
+        row_min, row_max, harvested, planted
+    ))
+    isBusy = false
+end
+
+-- ============================================================
+--                   PNB RANDOM WORLD MODE
+-- ============================================================
+
+local function reset_pnb_mode()
+    isInPnbMode     = false
+    pnbRandomWorld  = nil
+    pnbCycleCount   = 0
+    pnbNeedCollect  = false
+    pnbJustRejoined = false
+    log_status("🔄 PNB mode di-reset.")
+end
+
+local function do_pnb_in_random_world()
+    isBusy = true
+
+    -- Generate world random baru jika belum ada
+    if not pnbRandomWorld then
+        pnbRandomWorld = generate_random_world()
+        pnbCycleCount  = 0
+        log_status("🎲 World random PNB: " .. pnbRandomWorld)
+    end
+
+    isInPnbMode = true
+
+    -- ============================================================
+    --   INLINE REJOIN HELPER — dipakai di semua titik disconnect
+    --   Langsung reconnect + warp ke pnbRandomWorld dari dalam fungsi
+    --   tanpa bergantung ke STATE_CHANGED / handle_pnb_rejoin
+    -- ============================================================
+    local function pnb_ensure_connected(label)
+        if bot:state() == "InWorld" then return true end
+
+        log_status("⚠️ [" .. label .. "] Disconnect terdeteksi → auto rejoin ke " .. pnbRandomWorld .. "...")
+
+        local maxTry = 10
+        for attempt = 1, maxTry do
+            local state = bot:state()
+            if state == "InWorld" then
+                log_status("✅ [" .. label .. "] Kembali online! (attempt " .. attempt .. ")")
+                sleep_ms(1000)
+                
+                return true
+            end
+
+            log_status(string.format(
+                "🔄 [%s] Reconnect attempt %d/%d (state: %s)...",
+                label, attempt, maxTry, state
+            ))
+
+            if state == "Failed" or state == "Disconnected" then
+                bot:connect()
+                sleep_ms(2000)
+            elseif state == "MenuIdle" then
+                bot:warp(pnbRandomWorld)
+                sleep_ms(CONFIG.PNB_REJOIN_DELAY)
+            else
+                -- Connecting / unknown state, tunggu dulu
+                sleep_ms(2000)
+            end
+        end
+
+        log_status("❌ [" .. label .. "] Gagal reconnect setelah " .. maxTry .. " attempt, abort PNB mode.")
+        return false
+    end
+
+    -- ===== WARP AWAL KE WORLD RANDOM =====
+    log_status("🚀 Warp ke PNB world: " .. pnbRandomWorld .. " (siklus " .. (pnbCycleCount + 1) .. "/" .. CONFIG.PNB_MAX_CYCLES .. ")")
+    bot:warp(pnbRandomWorld)
+    sleep_ms(CONFIG.PNB_REJOIN_DELAY)
+
+    if not pnb_ensure_connected("WarpAwal") then
+        reset_pnb_mode()
+        bot:warp(CONFIG.FARM_WORLD)
+        sleep_ms(4500)
+        ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+        needCollect = true
+        isBusy      = false
+        return
+    end
+
+    sleep_ms(500)
+    
+
+    -- Simpan posisi awal di world random untuk PNB
+    local pos  = bot:pos()
+    pnbOriginX = pos.tile_x
+    pnbOriginY = pos.tile_y
+
+    -- ===================================================
+    --   LOOP SIKLUS: PNB → Collect  (per siklus = 1x)
+    -- ===================================================
+    while pnbCycleCount < CONFIG.PNB_MAX_CYCLES do
+
+        if not pnb_ensure_connected("AwalSiklus") then
+            reset_pnb_mode()
+            bot:warp(CONFIG.FARM_WORLD)
+            sleep_ms(4500)
+            ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+            needCollect = true
+            isBusy      = false
+            return
+        end
+
+        log_status(string.format(
+            "🎯 PNB siklus %d/%d di world: %s",
+            pnbCycleCount + 1, CONFIG.PNB_MAX_CYCLES, pnbRandomWorld
+        ))
+
+        -- ===== STEP 1: SB+HB per spot =====
+        local spots = {}
+        for _, spot in ipairs(CONFIG.PNB_SPOTS) do
+            table.insert(spots, {
+                x = pnbOriginX + spot.dx,
+                y = pnbOriginY + spot.dy,
+            })
+        end
+
+        for _, p in ipairs(spots) do
+
+            if not pnb_ensure_connected("SebelumSpot") then
+                reset_pnb_mode()
+                bot:warp(CONFIG.FARM_WORLD)
+                sleep_ms(4500)
+                ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+                needCollect = true
+                isBusy      = false
+                return
+            end
+
+            for i = 1, CONFIG.PNB_COUNT_BLOCK do
+
+                if bot:state() ~= "InWorld" then
+                    log_status("⚠️ Disconnect saat SB/HB (iterasi " .. i .. "), rejoin...")
+                    if not pnb_ensure_connected("SB-HB-iter" .. i) then
+                        reset_pnb_mode()
+                        bot:warp(CONFIG.FARM_WORLD)
+                        sleep_ms(4500)
+                        ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+                        needCollect = true
+                        isBusy      = false
+                        return
+                    end
+                end
+
+                bot:send("SB", {
+                    x         = p.x,
+                    y         = p.y,
+                    BlockType = CONFIG.TARGET_ID
+                })
+                for j = 1, CONFIG.PNB_HIT_COUNT do
+                    bot:send("HB", { x = p.x, y = p.y })
+                end
+            end
+        end
+
+        sleep_ms(CONFIG.PNB_LOOP_DELAY)
+
+        -- ===== STEP 2: COLLECT =====
+        -- Collect selalu diulang dari awal jika disconnect atau find_path gagal
+        -- pnbJustRejoined diabaikan di sini karena collect restart otomatis via nil
+        pnbJustRejoined = false  -- reset flag, tidak dipakai di sini
+
+        if not pnb_ensure_connected("SebelumCollect") then
+            reset_pnb_mode()
+            bot:warp(CONFIG.FARM_WORLD)
+            sleep_ms(4500)
+            ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+            needCollect = true
+            isBusy      = false
+            return
+        end
+
+        log_status("📦 Collect siklus ke-" .. (pnbCycleCount + 1) .. "...")
+
+        local function run_collect()
+            safe_find_path(pnbOriginX, pnbOriginY)
+            sleep_ms(500)
+
+            for _, spot in ipairs(CONFIG.PNB_SPOTS) do
+                local tx = pnbOriginX + spot.dx
+                local ty = pnbOriginY + spot.dy
+
+                if bot:state() ~= "InWorld" then
+                    if not pnb_ensure_connected("CollectMove") then
+                        return false
+                    end
+                    log_status("🔄 Rejoin saat collect → ulang dari spot pertama...")
+                    return nil
+                end
+
+                log_status("  → find_path ke (" .. tx .. ", " .. ty .. ")")
+
+                local ok = pcall(function() bot:find_path(tx, ty) end)
+                sleep_ms(500)
+                if not ok then
+                    log_status("⚠️ find_path gagal ke (" .. tx .. "," .. ty .. "), break block & retry...")
+                    clear_tile_if_blocked(tx, ty)
+                    sleep_ms(300)
+                    local ok2 = pcall(function() bot:find_path(tx, ty) end)
+                    sleep_ms(500)
+                    if not ok2 then
+                        log_status("⚠️ Masih gagal, ulang collect dari awal...")
+                        return nil
+                    end
+                end
+
+                sleep_ms(CONFIG.COLLECT_MOVE_DELAY)
+            end
+
+            log_status("🔙 Kembali ke origin (" .. pnbOriginX .. "," .. pnbOriginY .. ")")
+            safe_find_path(pnbOriginX, pnbOriginY)
+            sleep_ms(400)
+
+            return true
+        end
+
+        while true do
+            local result = run_collect()
+            if result == true then
+                break
+            elseif result == false then
+                reset_pnb_mode()
+                bot:warp(CONFIG.FARM_WORLD)
+                sleep_ms(4500)
+                ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+                needCollect = true
+                isBusy      = false
+                return
+            end
+            -- nil → disconnect atau find_path gagal, ulang collect dari awal
+            pnbJustRejoined = false
+            sleep_ms(1000)
+        end
+
+        -- Siklus selesai
+        pnbCycleCount   = pnbCycleCount + 1
+        pnbNeedCollect  = false
+        pnbJustRejoined = false
+
+        log_status(string.format(
+            "✅ Siklus %d/%d selesai di %s",
+            pnbCycleCount, CONFIG.PNB_MAX_CYCLES, pnbRandomWorld
+        ))
+
+        -- Cek inventory
+        local _, blockCount = get_inventory_count()
+        log_status("📊 Block count setelah siklus: " .. blockCount .. " (threshold: " .. CONFIG.BLOCK_THRESHOLD .. ")")
+
+        if blockCount < CONFIG.BLOCK_THRESHOLD then
+            log_status("📉 Block sudah berkurang di bawah threshold, keluar PNB mode lebih awal.")
+            break
+        end
+
+        if pnbCycleCount < CONFIG.PNB_MAX_CYCLES then
+            log_status("🔁 Lanjut siklus berikutnya di world yang sama: " .. pnbRandomWorld)
+            local pos2 = bot:pos()
+            pnbOriginX = pos2.tile_x
+            pnbOriginY = pos2.tile_y
+        end
+
+    end
+
+    -- ===== SELESAI SEMUA SIKLUS (atau block habis) → KEMBALI KE FARM =====
+    log_status(string.format(
+        "🏁 PNB mode selesai (%d siklus) → Kembali ke farm world: %s",
+        pnbCycleCount, CONFIG.FARM_WORLD
+    ))
+
+    reset_pnb_mode()
+
+    bot:warp(CONFIG.FARM_WORLD)
+    sleep_ms(4500)
+
+    if bot:state() ~= "InWorld" then
+        ensure_in_world(CONFIG.FARM_WORLD, "PNB-ReturnFarm")
+    end
+
+    needCollect = true
+    isBusy      = false
+end
+
+
+-- ============================================================
+--                         PLANT ROW
+-- ============================================================
+
+local function do_plant_row()
+    isBusy = true
+
+    local pos     = bot:pos()
+    local row     = pos.tile_y
+    local start_x = pos.tile_x + 2
+    local w       = bot:get_world()
+    local max_x   = w.width - 2
+
+    log_status("🌱 Plant dari X=" .. start_x .. " → X=" .. max_x)
+
+    for x = start_x, max_x do
+        local ok = pcall(function() bot:find_path(x, row) end)
+        if ok then
+            -- Break block yang menghalangi sebelum plant
+            break_blocking_blocks(x, row)
+
+            local tile = bot:get_tile(x, row)
+            if tile and tile.fg == 0 then
+                bot:plant(x, row, CONFIG.TARGET_ID)
+                sleep_ms(200)
+            end
+        end
+    end
+
+    log_status("✅ Plant selesai!")
+    isBusy = false
+end
+
+-- ============================================================
+--                       AUTO BAN
+-- ============================================================
+
+local function normalizeUsername(username)
+    local cleaned = tostring(username or ""):gsub("[^%w]", "")
+    return string.upper(cleaned)
+end
+
+local function isWhitelisted(username)
+    return CONFIG.WHITELIST[normalizeUsername(username)] == true
+end
+
+local function buildPlayerList()
+    local result = {}
+    for _, player in ipairs(bot:get_players()) do
+        result[player.user_id] = {
+            username = player.username,
+            user_id  = player.user_id,
+        }
+    end
+    return result
+end
+
+local function do_auto_ban()
+    if not CONFIG.AUTO_BAN_ENABLED then return end
+    -- Hanya aktif di farm world, bukan di save world atau pnb world
+    if isInSaveWorld then return end
+    if isInPnbMode then return end
+
+    local currentPlayers = buildPlayerList()
+
+    for userId, player in pairs(currentPlayers) do
+        if not knownPlayers[userId] then
+            local username = player.username or "UNKNOWN"
+            log_status("👤 Player join: " .. username .. " (ID: " .. userId .. ")")
+
+            if isWhitelisted(username) then
+                log_status("✅ WHITELIST OK → " .. username)
+            else
+                log_status("🚨 NON-WHITELIST → BAN: " .. username .. " (ID: " .. userId .. ")")
+                bot:world_ban(userId)
+                log_status("🔨 BANNED: " .. username)
+            end
+        end
+    end
+
+    knownPlayers = currentPlayers
+end
+
+-- ============================================================
+--                    AUTO BAN THREAD
+-- ============================================================
+
+runThread(function()
+    while true do
+        if bot and bot:state() == "InWorld" then
+            pcall(do_auto_ban)
+        end
+        sleep_ms(100)
+    end
+end)
+
+
+-- ============================================================
+--                       WORLD EVENTS
+-- ============================================================
+
+bot:on(events.JOINED_WORLD, function(data)
+    local worldName = data.world or ""
+    log_status("✅ Joined world: " .. worldName)
+    sleep_ms(2000)
+    
+    needCollect = true
+    isBusy      = false
+
+    -- Jika join ke PNB world (reconnect ditangani inline oleh pnb_ensure_connected)
+    if isInPnbMode and pnbRandomWorld and
+       string.upper(worldName) == string.upper(pnbRandomWorld) then
+        log_status("🔄 Rejoined ke PNB world: " .. worldName .. " → tandai untuk collect ulang dari awal.")
+        pnbJustRejoined = true
+        knownPlayers = buildPlayerList()
+        return
+    end
+
+    -- Jika join ke farm world
+    if string.upper(worldName) == string.upper(CONFIG.FARM_WORLD) then
+        local currentPlayers = buildPlayerList()
+        log_status("🛡️ Scan " .. (function() local c=0; for _ in pairs(currentPlayers) do c=c+1 end; return c end)() .. " pemain yang sudah ada di world...")
+
+        local pendingBan = {}
+        for userId, player in pairs(currentPlayers) do
+            local username = player.username or "UNKNOWN"
+            if isWhitelisted(username) then
+                log_status("✅ WHITELIST OK → " .. username)
+            else
+                log_status("⏳ NON-WHITELIST (ditunda) → akan di-ban setelah place lock: " .. username)
+                table.insert(pendingBan, { userId = userId, username = username })
+            end
+        end
+
+        knownPlayers = buildPlayerList()
+        sleep_ms(1000)
+
+        check_and_place_lock()
+
+        for _, p in ipairs(pendingBan) do
+            log_status("🚨 NON-WHITELIST → BAN (setelah lock): " .. p.username)
+            bot:world_ban(p.userId)
+            sleep_ms(300)
+        end
+
+        knownPlayers = buildPlayerList()
+        sleep_ms(1000)
+
+        check_and_place_lock()
+    else
+        knownPlayers = buildPlayerList()
+    end
+end)
+
+-- ============================================================
+--                       INITIAL JOIN
+-- ============================================================
+
+if bot:state() ~= "InWorld" then
+    log_status("🌐 Joining " .. CONFIG.FARM_WORLD .. "...")
+    bot:warp(CONFIG.FARM_WORLD)
+    sleep_ms(4500)
+else
+    refresh_world_data()
+end
+
+if bot:state() == "InWorld" then
+    sleep_ms(3000)
+end
+
+-- ============================================================
+--                         MAIN LOOP
+-- ============================================================
+
+log_status("╔══════════════════════════════════════╗")
+log_status("║       AUTO FARM BOT v2.1 STARTED     ║")
+log_status("╠══════════════════════════════════════╣")
+log_status("║ World       : " .. CONFIG.FARM_WORLD)
+log_status("║ Save World  : " .. CONFIG.SAVE_WORLD)
+log_status("║ Target      : ID " .. CONFIG.TARGET_ID)
+log_status("║ Rows        : " .. CONFIG.ROW_TOTAL)
+log_status("║ Seed Thresh : " .. CONFIG.SEED_THRESHOLD .. " (keep " .. CONFIG.KEEP_SEED_AMOUNT .. ")")
+log_status("║ PNB Cycles  : " .. CONFIG.PNB_MAX_CYCLES .. "x (pnb+collect) per world random")
+log_status("║ BuyPack     : " .. (CONFIG.BUY_PACK_ENABLED and "AKTIF (threshold: " .. CONFIG.GEM_THRESHOLD .. " gems)" or "NONAKTIF"))
+log_status("║ Auto Ban    : " .. (CONFIG.AUTO_BAN_ENABLED and "AKTIF" or "NONAKTIF"))
+log_status("╚══════════════════════════════════════╝")
+
+while true do
+    if bot:state() == "InWorld" and not isBusy then
+
+        local currentGems = bot.gems
+        local seedCount, blockCount = get_inventory_count()
+
+        -- ===== PRIORITAS 1: SEED THRESHOLD → STOP & DROP =====
+        if seedCount >= CONFIG.SEED_THRESHOLD then
+            log_status(string.format(
+                "🚨 SEED THRESHOLD! Seed: %d >= %d → Stop semua, warp save world!",
+                seedCount, CONFIG.SEED_THRESHOLD
+            ))
+            check_seed_threshold()
+
+        -- ===== PRIORITAS 2: BELI PACK =====
+        elseif CONFIG.BUY_PACK_ENABLED and currentGems >= CONFIG.GEM_THRESHOLD then
+            log_status("💎 Gems " .. currentGems .. " >= " .. CONFIG.GEM_THRESHOLD .. " → Beli pack!")
+            do_buy_pack()
+
+        -- ===== PRIORITAS 3: COLLECT MOVE (awal) =====
+        else
+            local base  = get_current_row()
+            local ready = count_all_ready_seeds()
+
+            log_status(string.format(
+                "💎 Gems: %d | Ready: %d (%d row) | Block: %d | Seed: %d / %d (threshold)",
+                currentGems, ready, CONFIG.ROW_TOTAL, blockCount, seedCount, CONFIG.SEED_THRESHOLD
+            ))
+
+            -- ===== BLOCK BANYAK → PNB DI WORLD RANDOM =====
+            if blockCount >= CONFIG.BLOCK_THRESHOLD then
+                log_status(string.format(
+                    "📦 Block: %d >= %d → Mulai PNB di world random!",
+                    blockCount, CONFIG.BLOCK_THRESHOLD
+                ))
+                -- Hanya generate world baru + reset siklus jika belum ada sesi PNB aktif
+                -- (jika isInPnbMode=true berarti baru rejoin, siklus harus dilanjutkan)
+                if not isInPnbMode then
+                    pnbRandomWorld = generate_random_world()
+                    pnbCycleCount  = 0
+                    pnbNeedCollect = false
+                    log_status("🎲 Sesi PNB baru → world: " .. pnbRandomWorld)
+                else
+                    log_status(string.format(
+                        "🔁 Lanjut sesi PNB yang sama → world: %s | siklus: %d/%d",
+                        pnbRandomWorld, pnbCycleCount, CONFIG.PNB_MAX_CYCLES
+                    ))
+                end
+                do_pnb_in_random_world()
+
+elseif ready > 0 and blockCount < CONFIG.BLOCK_THRESHOLD then
+                log_status("🌳 " .. ready .. " seed ready → tunggu semua row, lalu harvest...")
+                wait_until_rows_ready()
+                do_harvest_and_plant()
+
+            elseif seedCount > 5 then
+                do_plant_row()
+            end
+        end
+    end
+    sleep_ms(200)
+end
