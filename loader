@@ -1,3 +1,14 @@
+local LOCK_IDS = {
+    [2212] = true,  -- Newbie Lock
+    [413]  = true,  -- World Lock
+}
+local WATER_ID = 16
+
+local BLOCK_BLACKLIST = {
+    [110] = true,   -- Main Door / bedrock, jangan dihancurkan
+}
+
+
 -- ============================================================
 --                     STATE VARIABLES
 -- ============================================================
