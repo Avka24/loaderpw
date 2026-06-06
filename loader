@@ -6,7 +6,7 @@ local WATER_ID = 16
 
 local BLOCK_BLACKLIST = {
     [110] = true,   -- Main Door / bedrock, jangan dihancurkan
-    [329] = true,
+    [329] = true,   -- ID 329, jangan dihancurkan saat harvest/plant
 }
 
 
@@ -23,10 +23,11 @@ local pnbOriginY    = 0
 local knownPlayers  = {}
 
 -- ===== PNB RANDOM WORLD STATE =====
-local pnbRandomWorld    = nil   -- nama world random yang sedang dipakai
-local pnbCycleCount     = 0     -- jumlah siklus (pnb+collect) yang sudah selesai
-local isInPnbMode       = false -- sedang dalam mode PNB random world
-local pnbNeedCollect    = false -- apakah perlu collect setelah rejoin ke pnb world
+local pnbRandomWorld          = nil   -- nama world random yang sedang dipakai
+local pnbCycleCount           = 0     -- jumlah siklus (pnb+collect) yang sudah selesai
+local isInPnbMode             = false -- sedang dalam mode PNB random world
+local pnbNeedCollect          = false -- apakah perlu collect setelah rejoin ke pnb world
+local pnbNonWhitelistDetected = false -- flag dari background thread: ada non-whitelist di PNB world
 
 -- ============================================================
 
@@ -70,6 +71,11 @@ local function generate_random_world()
     end
 
     return name
+end
+
+local function get_world_base(worldName)
+    local base = worldName:match("^([^:]+)") or worldName
+    return string.upper(base)
 end
 
 -- ============================================================
@@ -934,6 +940,30 @@ local function do_harvest_and_plant()
 end
 
 -- ============================================================
+--              WHITELIST HELPER (harus di atas PNB mode)
+-- ============================================================
+
+local function normalizeUsername(username)
+    local cleaned = tostring(username or ""):gsub("[^%w]", "")
+    return string.upper(cleaned)
+end
+
+local function isWhitelisted(username)
+    return CONFIG.WHITELIST[normalizeUsername(username)] == true
+end
+
+local function buildPlayerList()
+    local result = {}
+    for _, player in ipairs(bot:get_players()) do
+        result[player.user_id] = {
+            username = player.username,
+            user_id  = player.user_id,
+        }
+    end
+    return result
+end
+
+-- ============================================================
 --                   PNB RANDOM WORLD MODE
 -- ============================================================
 
@@ -956,12 +986,11 @@ local function do_pnb_in_random_world()
         log_status("🎲 World random PNB: " .. pnbRandomWorld)
     end
 
-    isInPnbMode = true
+    isInPnbMode             = true
+    pnbNonWhitelistDetected = false  -- reset flag saat mulai sesi baru
 
     -- ============================================================
     --   INLINE REJOIN HELPER — dipakai di semua titik disconnect
-    --   Langsung reconnect + warp ke pnbRandomWorld dari dalam fungsi
-    --   tanpa bergantung ke STATE_CHANGED / handle_pnb_rejoin
     -- ============================================================
     local function pnb_ensure_connected(label)
         if bot:state() == "InWorld" then return true end
@@ -974,7 +1003,6 @@ local function do_pnb_in_random_world()
             if state == "InWorld" then
                 log_status("✅ [" .. label .. "] Kembali online! (attempt " .. attempt .. ")")
                 sleep_ms(1000)
-                
                 return true
             end
 
@@ -990,12 +1018,57 @@ local function do_pnb_in_random_world()
                 bot:warp(pnbRandomWorld)
                 sleep_ms(CONFIG.PNB_REJOIN_DELAY)
             else
-                -- Connecting / unknown state, tunggu dulu
                 sleep_ms(2000)
             end
         end
 
         log_status("❌ [" .. label .. "] Gagal reconnect setelah " .. maxTry .. " attempt, abort PNB mode.")
+        return false
+    end
+
+    -- ============================================================
+    --   HELPER: cek flag non-whitelist, jika true → ganti world
+    --   Return true = lanjut, false = abort total
+    -- ============================================================
+    local function pnb_handle_nonwhitelist_flag()
+        if not pnbNonWhitelistDetected then return true end
+
+        log_status("🚨 Flag non-whitelist aktif → generate world baru & warp!")
+        pnbNonWhitelistDetected = false
+        pnbRandomWorld          = generate_random_world()
+        pnbCycleCount           = 0
+        log_status("🎲 Warp ke world baru: " .. pnbRandomWorld)
+        bot:warp(pnbRandomWorld)
+        sleep_ms(CONFIG.PNB_REJOIN_DELAY)
+
+        local maxRetry = 10
+        for i = 1, maxRetry do
+            if bot:state() == "InWorld" then
+                -- Tunggu sebentar lagi biar player list ter-update server
+                sleep_ms(800)
+                -- Cek lagi — mungkin world baru ini juga ada orangnya
+                if pnbNonWhitelistDetected then
+                    log_status("⚠️ World baru juga terdeteksi non-whitelist, coba lagi...")
+                    pnbNonWhitelistDetected = false
+                    pnbRandomWorld          = generate_random_world()
+                    pnbCycleCount           = 0
+                    bot:warp(pnbRandomWorld)
+                    sleep_ms(CONFIG.PNB_REJOIN_DELAY)
+                else
+                    local pos2 = bot:pos()
+                    pnbOriginX = pos2.tile_x
+                    pnbOriginY = pos2.tile_y
+                    log_status("✅ World baru aman: " .. pnbRandomWorld)
+                    return true
+                end
+            else
+                if not pnb_ensure_connected("GantiWorld-" .. i) then
+                    return false
+                end
+            end
+        end
+
+        log_status("❌ Gagal menemukan world aman setelah banyak percobaan, abort PNB.")
         return false
     end
 
@@ -1014,8 +1087,8 @@ local function do_pnb_in_random_world()
         return
     end
 
-    sleep_ms(500)
-    
+    -- Tunggu sebentar biar background thread sempat scan player
+    sleep_ms(1000)
 
     -- Simpan posisi awal di world random untuk PNB
     local pos  = bot:pos()
@@ -1026,6 +1099,17 @@ local function do_pnb_in_random_world()
     --   LOOP SIKLUS: PNB → Collect  (per siklus = 1x)
     -- ===================================================
     while pnbCycleCount < CONFIG.PNB_MAX_CYCLES do
+
+        -- Cek flag non-whitelist sebelum mulai siklus
+        if not pnb_handle_nonwhitelist_flag() then
+            reset_pnb_mode()
+            bot:warp(CONFIG.FARM_WORLD)
+            sleep_ms(4500)
+            ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+            needCollect = true
+            isBusy      = false
+            return
+        end
 
         if not pnb_ensure_connected("AwalSiklus") then
             reset_pnb_mode()
@@ -1053,6 +1137,33 @@ local function do_pnb_in_random_world()
 
         for _, p in ipairs(spots) do
 
+            -- Cek flag non-whitelist di setiap pergantian spot
+            if pnbNonWhitelistDetected then
+                log_status("🚨 Non-whitelist terdeteksi saat SB/HB → interrupt, ganti world!")
+                if not pnb_handle_nonwhitelist_flag() then
+                    reset_pnb_mode()
+                    bot:warp(CONFIG.FARM_WORLD)
+                    sleep_ms(4500)
+                    ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+                    needCollect = true
+                    isBusy      = false
+                    return
+                end
+                -- Reset spots karena mungkin sudah pindah world, update origin
+                local posNew = bot:pos()
+                pnbOriginX = posNew.tile_x
+                pnbOriginY = posNew.tile_y
+                -- Rebuild spots dengan origin baru
+                spots = {}
+                for _, spot in ipairs(CONFIG.PNB_SPOTS) do
+                    table.insert(spots, {
+                        x = pnbOriginX + spot.dx,
+                        y = pnbOriginY + spot.dy,
+                    })
+                end
+                break  -- keluar dari loop spot, mulai ulang SB/HB dari awal di world baru
+            end
+
             if not pnb_ensure_connected("SebelumSpot") then
                 reset_pnb_mode()
                 bot:warp(CONFIG.FARM_WORLD)
@@ -1064,6 +1175,9 @@ local function do_pnb_in_random_world()
             end
 
             for i = 1, CONFIG.PNB_COUNT_BLOCK do
+
+                -- Cek flag non-whitelist di setiap iterasi SB/HB
+                if pnbNonWhitelistDetected then break end
 
                 if bot:state() ~= "InWorld" then
                     log_status("⚠️ Disconnect saat SB/HB (iterasi " .. i .. "), rejoin...")
@@ -1092,9 +1206,21 @@ local function do_pnb_in_random_world()
         sleep_ms(CONFIG.PNB_LOOP_DELAY)
 
         -- ===== STEP 2: COLLECT =====
-        -- Collect selalu diulang dari awal jika disconnect atau find_path gagal
-        -- pnbJustRejoined diabaikan di sini karena collect restart otomatis via nil
-        pnbJustRejoined = false  -- reset flag, tidak dipakai di sini
+        pnbJustRejoined = false
+
+        -- Cek flag sebelum collect
+        if pnbNonWhitelistDetected then
+            log_status("🚨 Non-whitelist terdeteksi sebelum collect → ganti world!")
+            if not pnb_handle_nonwhitelist_flag() then
+                reset_pnb_mode()
+                bot:warp(CONFIG.FARM_WORLD)
+                sleep_ms(4500)
+                ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+                needCollect = true
+                isBusy      = false
+                return
+            end
+        end
 
         if not pnb_ensure_connected("SebelumCollect") then
             reset_pnb_mode()
@@ -1115,6 +1241,12 @@ local function do_pnb_in_random_world()
             for _, spot in ipairs(CONFIG.PNB_SPOTS) do
                 local tx = pnbOriginX + spot.dx
                 local ty = pnbOriginY + spot.dy
+
+                -- Cek flag non-whitelist di setiap langkah collect
+                if pnbNonWhitelistDetected then
+                    log_status("🚨 Non-whitelist terdeteksi saat collect → interrupt!")
+                    return "nonwhitelist"
+                end
 
                 if bot:state() ~= "InWorld" then
                     if not pnb_ensure_connected("CollectMove") then
@@ -1154,6 +1286,19 @@ local function do_pnb_in_random_world()
             local result = run_collect()
             if result == true then
                 break
+            elseif result == "nonwhitelist" then
+                -- Handle ganti world lalu lanjut collect ulang
+                if not pnb_handle_nonwhitelist_flag() then
+                    reset_pnb_mode()
+                    bot:warp(CONFIG.FARM_WORLD)
+                    sleep_ms(4500)
+                    ensure_in_world(CONFIG.FARM_WORLD, "PNB-AbortReturnFarm")
+                    needCollect = true
+                    isBusy      = false
+                    return
+                end
+                -- Ulang collect di world baru
+                sleep_ms(500)
             elseif result == false then
                 reset_pnb_mode()
                 bot:warp(CONFIG.FARM_WORLD)
@@ -1162,10 +1307,11 @@ local function do_pnb_in_random_world()
                 needCollect = true
                 isBusy      = false
                 return
+            else
+                -- nil → disconnect atau find_path gagal, ulang collect dari awal
+                pnbJustRejoined = false
+                sleep_ms(1000)
             end
-            -- nil → disconnect atau find_path gagal, ulang collect dari awal
-            pnbJustRejoined = false
-            sleep_ms(1000)
         end
 
         -- Siklus selesai
@@ -1253,26 +1399,6 @@ end
 --                       AUTO BAN
 -- ============================================================
 
-local function normalizeUsername(username)
-    local cleaned = tostring(username or ""):gsub("[^%w]", "")
-    return string.upper(cleaned)
-end
-
-local function isWhitelisted(username)
-    return CONFIG.WHITELIST[normalizeUsername(username)] == true
-end
-
-local function buildPlayerList()
-    local result = {}
-    for _, player in ipairs(bot:get_players()) do
-        result[player.user_id] = {
-            username = player.username,
-            user_id  = player.user_id,
-        }
-    end
-    return result
-end
-
 local function do_auto_ban()
     if not CONFIG.AUTO_BAN_ENABLED then return end
     -- Hanya aktif di farm world, bukan di save world atau pnb world
@@ -1302,13 +1428,81 @@ end
 -- ============================================================
 --                    AUTO BAN THREAD
 -- ============================================================
-
 runThread(function()
     while true do
         if bot and bot:state() == "InWorld" then
-            pcall(do_auto_ban)
+            pcall(function()
+                -- Skip jika di save world
+                if isInSaveWorld then return end
+
+                local currentPlayers = buildPlayerList()
+
+                for userId, player in pairs(currentPlayers) do
+                    local username = player.username or "UNKNOWN"
+
+                    -- Deteksi player BARU (belum ada di knownPlayers)
+                    if not knownPlayers[userId] then
+                        log_status("👤 Player join: " .. username .. " (ID: " .. userId .. ")")
+
+                        if isWhitelisted(username) then
+                            log_status("✅ WHITELIST OK → " .. username)
+                        else
+                            log_status("🚨 NON-WHITELIST → BAN: " .. username)
+
+                            -- Jika sedang PNB mode → set flag, biar loop utama yang handle
+                            if isInPnbMode then
+                                log_status("⚠️ Sedang PNB mode → set flag non-whitelist!")
+                                pnbNonWhitelistDetected = true
+                            else
+                                -- Di farm world → langsung ban
+                                bot:world_ban(userId)
+                                log_status("🔨 BANNED: " .. username)
+                            end
+                        end
+                    end
+                end
+
+                knownPlayers = currentPlayers
+            end)
         end
         sleep_ms(100)
+    end
+end)
+
+-- ============================================================
+--          PNB WORLD MONITOR THREAD (background)
+--   Scan terus selama isInPnbMode aktif.
+--   Jika ada player NON-WHITELIST → set flag pnbNonWhitelistDetected
+--   Logika utama (do_pnb_in_random_world) akan cek flag ini
+--   dan langsung warp ke world baru, walau sedang find_path / SB / HB.
+-- ============================================================
+
+runThread(function()
+    while true do
+        if bot and bot:state() == "InWorld" and isInPnbMode then
+            local ok, err = pcall(function()
+                local players = bot:get_players()
+                for _, player in ipairs(players) do
+                    local uname = player.username or "UNKNOWN"
+                    if not isWhitelisted(uname) then
+                        if not pnbNonWhitelistDetected then
+                            log_status(string.format(
+                                "🚨 [PNB-Monitor] Player NON-WHITELIST terdeteksi: %s → set flag warp!",
+                                uname
+                            ))
+                            pnbNonWhitelistDetected = true
+                        end
+                        return  -- cukup deteksi 1 orang, langsung keluar loop
+                    end
+                end
+            end)
+            if not ok then
+                log_status("⚠️ [PNB-Monitor] Error saat scan: " .. tostring(err))
+            end
+            sleep_ms(300)  -- scan setiap 300ms, responsif tapi tidak spam
+        else
+            sleep_ms(200)
+        end
     end
 end)
 
@@ -1327,7 +1521,7 @@ bot:on(events.JOINED_WORLD, function(data)
 
     -- Jika join ke PNB world (reconnect ditangani inline oleh pnb_ensure_connected)
     if isInPnbMode and pnbRandomWorld and
-       string.upper(worldName) == string.upper(pnbRandomWorld) then
+   get_world_base(worldName) == get_world_base(pnbRandomWorld) then
         log_status("🔄 Rejoined ke PNB world: " .. worldName .. " → tandai untuk collect ulang dari awal.")
         pnbJustRejoined = true
         knownPlayers = buildPlayerList()
@@ -1335,7 +1529,7 @@ bot:on(events.JOINED_WORLD, function(data)
     end
 
     -- Jika join ke farm world
-    if string.upper(worldName) == string.upper(CONFIG.FARM_WORLD) then
+    if get_world_base(worldName) == get_world_base(CONFIG.FARM_WORLD) then
         local currentPlayers = buildPlayerList()
         log_status("🛡️ Scan " .. (function() local c=0; for _ in pairs(currentPlayers) do c=c+1 end; return c end)() .. " pemain yang sudah ada di world...")
 
